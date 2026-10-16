@@ -45,7 +45,6 @@ NEWSAPI_QUERIES = [
 # you add here.
 TICKERS = [
     "AAPL", "TSLA", "NVDA", "MSFT", "AMZN",
-    "RELIANCE.NS", "TCS.NS", "INFY.NS", "HDFCBANK.NS",
 ]
 
 # How many days back to search (NewsAPI free tier: max 30 days)
@@ -121,6 +120,47 @@ def fetch_yfinance_headlines() -> list[dict]:
     print(f"[yfinance] Fetched {len(results)} headlines across {len(TICKERS)} tickers.")
     return results
 
+# Ticker-specific NewsAPI queries for Indian stocks, reused from
+# backfill_historical.py. yf.Search returns no tagged news for .NS symbols.
+INDIAN_TICKER_QUERIES = {
+    "RELIANCE.NS": '"Reliance Industries"',
+    "TCS.NS": '"Tata Consultancy Services" OR "TCS"',
+    "INFY.NS": "Infosys",
+    "HDFCBANK.NS": '"HDFC Bank"',
+}
+
+
+def fetch_indian_newsapi_headlines() -> list[dict]:
+    """Ticker-tagged headlines for Indian stocks via NewsAPI title search."""
+    client = NewsApiClient(api_key=NEWSAPI_KEY)
+    from_date = (datetime.utcnow() - timedelta(days=DAYS_BACK)).strftime("%Y-%m-%d")
+
+    results = []
+    for ticker_symbol, query in INDIAN_TICKER_QUERIES.items():
+        try:
+            response = client.get_everything(
+                qintitle=query,
+                from_param=from_date,
+                language="en",
+                sort_by="publishedAt",
+                page_size=MAX_ARTICLES_PER_QUERY,
+            )
+            for article in response.get("articles", []):
+                headline = (article.get("title") or "").strip()
+                if headline and headline != "[Removed]":
+                    results.append({
+                        "source": "newsapi",
+                        "ticker": ticker_symbol,
+                        "headline": headline,
+                        "published_at": article.get("publishedAt", ""),
+                        "query": ticker_symbol,
+                    })
+        except Exception as e:
+            print(f"[NewsAPI-IN] Error fetching '{ticker_symbol}': {e}")
+
+    print(f"[NewsAPI-IN] Fetched {len(results)} headlines across {len(INDIAN_TICKER_QUERIES)} Indian tickers.")
+    return results
+
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -128,6 +168,7 @@ def get_all_headlines() -> list[dict]:
     """Fetch from all sources and return combined, deduplicated headline list."""
     all_headlines = []
     all_headlines.extend(fetch_newsapi_headlines())
+    all_headlines.extend(fetch_indian_newsapi_headlines())
     all_headlines.extend(fetch_yfinance_headlines())
 
     # Deduplicate by exact headline text
