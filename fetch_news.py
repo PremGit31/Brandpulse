@@ -90,29 +90,29 @@ def fetch_newsapi_headlines() -> list[dict]:
 
 
 def fetch_yfinance_headlines() -> list[dict]:
-    """Pull recent news headlines from yfinance for each ticker."""
+    """Recent news per ticker via yf.Search (Ticker.news has been
+    returning [] since Yahoo withdrew its endpoint on 2026-10-02)."""
     results = []
     for ticker_symbol in TICKERS:
         try:
-            ticker = yf.Ticker(ticker_symbol)
-            news_items = ticker.news  # list of dicts
-            for item in news_items[:MAX_ARTICLES_PER_QUERY]:
-                # yfinance returns content in nested structure
-                content = item.get("content", {})
-                headline = content.get("title", "").strip()
-                pub_date = content.get("pubDate", "")
+            search = yf.Search(ticker_symbol, news_count=MAX_ARTICLES_PER_QUERY * 2)
+            items = search.news or []
 
-                # fallback for older yfinance schema
-                if not headline:
-                    headline = item.get("title", "").strip()
-                    pub_date = item.get("providerPublishTime", "")
+            # Search is relevance-ranked, so keep only articles Yahoo
+            # explicitly tags with this ticker.
+            tagged = [i for i in items if ticker_symbol in (i.get("relatedTickers") or [])]
 
+            if not tagged:
+                print(f"[yfinance] WARNING: no tagged news for {ticker_symbol}")
+
+            for item in tagged[:MAX_ARTICLES_PER_QUERY]:
+                headline = (item.get("title") or "").strip()
                 if headline:
                     results.append({
                         "source": "yfinance",
                         "ticker": ticker_symbol,
                         "headline": headline,
-                        "published_at": str(pub_date),
+                        "published_at": str(item.get("providerPublishTime", "")),
                         "query": ticker_symbol,
                     })
         except Exception as e:
