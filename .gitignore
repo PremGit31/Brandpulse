@@ -18,3 +18,4 @@ venv/
 spark-warehouse/
 derby.log
 metastore_db/
+check_yfinance.py
