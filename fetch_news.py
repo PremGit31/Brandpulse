@@ -10,7 +10,7 @@ Returns a unified list of dicts:
 """
 
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 # pyrefly: ignore [missing-import]
 from dotenv import load_dotenv
 # pyrefly: ignore [missing-import]
@@ -99,7 +99,19 @@ def fetch_yfinance_headlines() -> list[dict]:
 
             # Search is relevance-ranked, so keep only articles Yahoo
             # explicitly tags with this ticker.
-            tagged = [i for i in items if ticker_symbol in (i.get("relatedTickers") or [])]
+            TICKER_NAMES = {
+                "AAPL": ("apple", "aapl"),
+                "TSLA": ("tesla", "tsla"),
+                "NVDA": ("nvidia", "nvda"),
+                "MSFT": ("microsoft", "msft"),
+                "AMZN": ("amazon", "amzn"),
+            }
+
+            tagged = [
+                i for i in items
+                if ticker_symbol in (i.get("relatedTickers") or [])
+                and any(n in (i.get("title") or "").lower() for n in TICKER_NAMES[ticker_symbol])
+            ]
 
             if not tagged:
                 print(f"[yfinance] WARNING: no tagged news for {ticker_symbol}")
@@ -107,11 +119,19 @@ def fetch_yfinance_headlines() -> list[dict]:
             for item in tagged[:MAX_ARTICLES_PER_QUERY]:
                 headline = (item.get("title") or "").strip()
                 if headline:
+                    publish_time = item.get("providerPublishTime")
+                    published_at = (
+                        datetime.fromtimestamp(int(publish_time), tz=timezone.utc)
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                        if publish_time not in (None, "")
+                        else ""
+                    )
                     results.append({
                         "source": "yfinance",
                         "ticker": ticker_symbol,
                         "headline": headline,
-                        "published_at": str(item.get("providerPublishTime", "")),
+                        "published_at": published_at,
                         "query": ticker_symbol,
                     })
         except Exception as e:

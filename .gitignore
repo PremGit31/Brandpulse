@@ -20,4 +20,8 @@ derby.log
 metastore_db/
 check_yfinance.py
 
+# Delta Lake data (generated, not source code)
+delta/
+delta_test/
+checkpoints/
 historical_sentiment_30d.csv
