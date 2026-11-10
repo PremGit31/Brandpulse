@@ -6,11 +6,11 @@ columns, runs FinBERT sentiment inference on each micro-batch via
 foreachBatch, and enriches ticker-level rows with current price data
 (see fetch_price.py — Finnhub for US tickers, yfinance for Indian
 ".NS"/".BO" tickers, both cached with a TTL). Prints sentiment+price
-results to console. Delta Lake writing will be added inside
-process_batch() in Phase 4.
+results to console and stores each batch idempotently in Delta Lake.
 
 Run with:
-    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.1 spark_consumer.py
+    python -m pip install --upgrade pyspark==4.1.3
+    spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.13:4.1.3,io.delta:delta-spark_4.1_2.13:4.3.0 spark_consumer.py
 
 Requires:
   - Java 17 or 21 (JAVA_HOME set)
@@ -19,19 +19,30 @@ Requires:
 """
 
 import sys
+import time
+import pandas as pd
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from delta.tables import DeltaTable
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, from_json
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
 from fetch_price import get_prices_for_tickers
 
-# Windows' default console encoding (cp1252) can't represent many Unicode
-# characters that show up in real headlines (currency symbols like ₹, curly
-# quotes, em dashes, etc). Without this, a single such character in any
-# headline crashes the print() call and kills the entire streaming query.
-# Forcing UTF-8 here makes stdout able to handle virtually any character.
+DELTA_PATH = r"C:\Users\Prem\Brandpulse\delta\sentiment"
+CHECKPOINT_PATH = r"C:\Users\Prem\Brandpulse\checkpoints\sentiment"
+
+# Windows can write UTF-8 from Python while the attached console still
+# decodes output using a legacy code page, producing mojibake. Set the
+# console's output code page as well as Python's stream encoding.
+if sys.platform == "win32" and sys.stdout.isatty():
+    import ctypes
+
+    if not ctypes.windll.kernel32.SetConsoleOutputCP(65001):
+        raise ctypes.WinError()
+
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ---------------------------------------------------------------------------
 # 1. Schema of the JSON messages your producer publishes.
@@ -43,6 +54,22 @@ news_schema = StructType([
     StructField("ticker", StringType()),
     StructField("source", StringType()),
     StructField("published_at", StringType()),
+    StructField("message_id", StringType()),
+    StructField("ingested_at", StringType()),
+])
+
+delta_schema = StructType([
+    StructField("message_id", StringType()),
+    StructField("ticker", StringType()),
+    StructField("headline", StringType()),
+    StructField("source", StringType()),
+    StructField("published_at", StringType()),
+    StructField("ingested_at", StringType()),
+    StructField("sentiment", StringType()),
+    StructField("confidence", DoubleType()),
+    StructField("price", DoubleType()),
+    StructField("price_change_pct", DoubleType()),
+    StructField("price_status", StringType()),
 ])
 
 # ---------------------------------------------------------------------------
@@ -85,24 +112,27 @@ def score_sentiment(headlines):
 def process_batch(batch_df, batch_id):
     """Called by Spark once per micro-batch. batch_df is a normal Spark
     DataFrame containing just the new rows since the last batch. We convert
-    it to pandas, run FinBERT on all headlines in the batch at once, and
-    print the results. This is also where the Delta Lake write will go
-    in Phase 4."""
+    it to pandas, run FinBERT on all headlines in the batch at once,
+    enrich prices, store results in Delta Lake, and print them."""
     pdf = batch_df.toPandas()
     if pdf.empty:
         print(f"[Batch {batch_id}] No rows.")
         return
+
+    print(
+        f"[Batch {batch_id}] message_id nulls={pdf['message_id'].isna().sum()}, "
+        f"ingested_at nulls={pdf['ingested_at'].isna().sum()}"
+    )
 
     sentiments = score_sentiment(pdf["headline"].tolist())
     pdf["sentiment"] = [s[0] for s in sentiments]
     pdf["confidence"] = [s[1] for s in sentiments]
 
     # ── Price enrichment ────────────────────────────────────────────────
-    # Only yfinance-sourced headline rows carry a ticker (NewsAPI rows are
-    # general-market headlines with ticker=None and are skipped here on
-    # purpose). get_prices_for_tickers() routes each ticker to Finnhub
-    # (US) or yfinance (.NS/.BO Indian tickers) and handles caching
-    # internally — this call is cheap when everything hits cache.
+    # Ticker-tagged rows from yfinance and ticker-specific NewsAPI searches
+    # carry a ticker; broad NewsAPI market headlines are untagged and skipped.
+    # get_prices_for_tickers() routes each ticker to Finnhub (US) or yfinance
+    # (.NS/.BO Indian tickers) and handles caching internally.
     tickers_in_batch = pdf["ticker"].dropna().unique().tolist()
     prices = get_prices_for_tickers(tickers_in_batch)
 
@@ -121,25 +151,65 @@ def process_batch(batch_df, batch_id):
     pdf["price_change_pct"] = pdf["ticker"].apply(lambda t: _price_field(t, "change_pct"))
     pdf["price_status"] = pdf["ticker"].apply(lambda t: _price_field(t, "status"))
 
+    delta_pdf = pdf[delta_schema.fieldNames()].astype(object)
+    delta_pdf = delta_pdf.where(pd.notna(delta_pdf), None)
+    delta_df = batch_df.sparkSession.createDataFrame(delta_pdf, schema=delta_schema)
+
     print(f"\n[Batch {batch_id}] {len(pdf)} headlines scored")
     print("-" * 100)
     for _, row in pdf.iterrows():
         try:
-            ticker = row["ticker"] if row["ticker"] else "-"
+            ticker = row["ticker"] if pd.notna(row["ticker"]) else "-"
             headline = row["headline"][:70] if row["headline"] else ""
-            if row["price"] is not None:
+            if pd.notna(row["price"]):
                 currency = _currency_symbol(row["ticker"])
-                price_str = f"{currency}{row['price']:.2f} ({row['price_change_pct']}%, {row['price_status']})"
+                price_change_pct = (
+                    row["price_change_pct"]
+                    if pd.notna(row["price_change_pct"])
+                    else "N/A"
+                )
+                price_str = f"{currency}{row['price']:.2f} ({price_change_pct}%, {row['price_status']})"
             else:
                 price_str = "-"
             print(
                 f"  {row['sentiment']:<9} {row['confidence']:>5.1f}%  "
-                f"[{str(row['source']):<9}] {str(ticker):<6}  {price_str:<28}  {headline}"
+                f"[{str(row['source']):<9}] {str(ticker):<12}  {price_str:<28}  {headline}"
             )
         except Exception as e:
             # Defense in depth: one bad row should never take down the
             # whole streaming query. Log it and keep going.
             print(f"  [!] Could not print one row: {e}")
+
+    spark = batch_df.sparkSession
+    batch_rows = len(pdf)
+    unique_delta_df = delta_df.dropDuplicates(["message_id"])
+
+    if DeltaTable.isDeltaTable(spark, DELTA_PATH):
+        delta_table = DeltaTable.forPath(spark, DELTA_PATH)
+        merge_started = time.perf_counter()
+        delta_table.alias("t").merge(
+            unique_delta_df.alias("s"),
+            "t.message_id = s.message_id",
+        ).whenNotMatchedInsertAll().execute()
+        operation_seconds = time.perf_counter() - merge_started
+        operation_metrics = (
+            delta_table.history(1).select("operationMetrics").first()["operationMetrics"]
+        )
+        inserted_rows = int(operation_metrics["numTargetRowsInserted"])
+        operation_name = "merge"
+    else:
+        unique_rows = unique_delta_df.count()
+        write_started = time.perf_counter()
+        unique_delta_df.write.format("delta").mode("append").save(DELTA_PATH)
+        operation_seconds = time.perf_counter() - write_started
+        inserted_rows = unique_rows
+        operation_name = "initial write"
+
+    print(
+        f"[Batch {batch_id}] rows in batch={batch_rows}, "
+        f"rows inserted={inserted_rows}, "
+        f"{operation_name} time={operation_seconds:.2f}s"
+    )
 
 
 def main():
@@ -147,6 +217,9 @@ def main():
         SparkSession.builder
         .appName("BrandPulseSparkConsumer")
         .master("local[*]")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog")
+        .config("spark.sql.shuffle.partitions", "4")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
@@ -171,6 +244,7 @@ def main():
         parsed_stream.writeStream
         .foreachBatch(process_batch)
         .outputMode("append")
+        .option("checkpointLocation", CHECKPOINT_PATH)
         .start()
     )
 
