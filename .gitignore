@@ -25,3 +25,5 @@ delta/
 delta_test/
 checkpoints/
 historical_sentiment_30d.csv
+NewsTheme.json
+price_cache.json
