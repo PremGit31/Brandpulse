@@ -298,16 +298,38 @@ def aggregate(headlines_df: pd.DataFrame, prices_df: pd.DataFrame) -> pd.DataFra
     ).round(2)
 
     merged = pd.merge(daily_sentiment, prices_df, on=["ticker", "date"], how="left")
-    # Non-trading days (weekends/holidays) won't have a price row — carry
-    # the most recent known close forward per ticker rather than leaving
-    # sentiment days with no price context at all.
+
+    # A price row exists only on days the market traded. Record that BEFORE
+    # any forward-fill so downstream tools can tell real days from carried ones.
+    merged["is_trading_day"] = merged["close"].notna()
+
+    # Carry the last known close forward for context on weekends/holidays,
+    # but leave price_change_pct blank there. Forward-filling it would repeat
+    # one real move across several calendar days and overcount it.
     merged = merged.sort_values(["ticker", "date"])
-    merged[["close", "price_change_pct"]] = (
-        merged.groupby("ticker")[["close", "price_change_pct"]].ffill()
+    merged["close"] = merged.groupby("ticker")["close"].ffill()
+
+    # Reaction alignment: headlines on a non-trading day (e.g. Saturday
+    # results) are reacted to on the NEXT trading day. merge_asof looks
+    # forward against the full price series, not just days that happen to
+    # have headlines, so it finds the true next session.
+    reaction = prices_df[["ticker", "date", "price_change_pct"]].rename(
+        columns={"date": "reaction_date", "price_change_pct": "reaction_change_pct"}
     )
+    reaction["reaction_date"] = pd.to_datetime(reaction["reaction_date"])
+    merged["_date_dt"] = pd.to_datetime(merged["date"])
+
+    merged = pd.merge_asof(
+        merged.sort_values("_date_dt"),
+        reaction.sort_values("reaction_date"),
+        left_on="_date_dt",
+        right_on="reaction_date",
+        by="ticker",
+        direction="forward",
+    ).drop(columns=["_date_dt"])
+    merged["reaction_date"] = merged["reaction_date"].dt.date
 
     return merged.sort_values(["ticker", "date"]).reset_index(drop=True)
-
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
